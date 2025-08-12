@@ -11,20 +11,22 @@ permissions:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     concurrency:
       group: qps-bot
       cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # Create package.json if missing, then install Playwright & Chromium deps
-      - name: Install Playwright
+      # Make the runner self-sufficient (no package.json required)
+      - name: Install Playwright + Chromium deps
         shell: bash
         run: |
           set -euxo pipefail
@@ -34,28 +36,23 @@ jobs:
           npm install playwright@latest
           npx playwright install --with-deps chromium
 
-      # Quick sanity: show files so we can confirm the repo contents
-      - name: List repo
-        run: ls -la
-
-      # Create the 'login' file from repo secrets (do NOT commit this file)
-      - name: Create login file
+      - name: Create login file from secrets
+        shell: bash
         run: |
           printf "%s\n%s\n" "${{ secrets.TEQ_EMAIL }}" "${{ secrets.TEQ_PASSWORD }}" > login
 
-      # Run the bot (DRY RUN for now)
       - name: Run QPS autopilot (DRY RUN)
         env:
+          # Your environment
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
-          HEADLESS: "true"                      # CI should run headless
-          DRY_RUN: "true"                       # flip to "false" to apply changes live
-          DEBUG_API: "0"
-          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"
-          # ALLOW_DSP_IDS: ""                   # optional IDs: e.g. "15,400,1234"
+          HEADLESS: "true"             # CI must run headless
+          DRY_RUN: "true"              # set to "false" to apply changes
+          DEBUG_API: "0"               # set to "1" only when debugging token/API
+          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn" # or "ALL"
+          # ALLOW_DSP_IDS: "15,184,320" # optional numeric allow-list
         run: node run-qps-autopilot.js
 
-      # Upload outputs (snapshot + actions CSVs)
-      - name: Upload artifacts
+      - name: Upload artifacts (snapshots/actions)
         if: always()
         uses: actions/upload-artifact@v4
         with:
