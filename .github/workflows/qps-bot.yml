@@ -48,10 +48,12 @@ jobs:
         env:
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
           HEADLESS: "true"          # headless in CI
-          DRY_RUN: "false"           # flip to "false" to apply changes
+          DRY_RUN: "true"          # flip to "true" for dry-run
           DEBUG_API: "0"            # set "1" if you need API debug logs
-          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"
-          # ALLOW_DSP_IDS: "15,184,320"
+          ALLOW_DSPS: "ALL"         # <— act on ALL
+          EXCLUDE_DSPS: "Magnite"   # <— except Magnite
+          # ALLOW_DSP_IDS: "15,184,320"   # optional include-by-ID
+          # EXCLUDE_DSP_IDS: "999"        # optional exclude-by-ID
         run: node run-qps-autopilot.js
 
       - name: Upload artifacts (snapshots/actions)
