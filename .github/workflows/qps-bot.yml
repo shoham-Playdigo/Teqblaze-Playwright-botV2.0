@@ -1,0 +1,56 @@
+name: QPS Autopilot (hourly)
+
+on:
+  schedule:
+    - cron: "5 * * * *"   # runs at minute 5 past every hour (UTC)
+  workflow_dispatch:       # manual runs
+
+permissions:
+  contents: read
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: qps-bot
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Install Playwright and Chromium with system deps
+      - name: Install Playwright
+        run: |
+          npm ci || npm i
+          npx playwright install --with-deps chromium
+
+      # Create the 'login' file from repo secrets (not committed)
+      - name: Create login file
+        run: |
+          printf "%s\n%s\n" "${{ secrets.TEQ_EMAIL }}" "${{ secrets.TEQ_PASSWORD }}" > login
+
+      # Run the bot (DRY RUN for now)
+      - name: Run QPS autopilot (DRY RUN)
+        env:
+          TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
+          HEADLESS: "true"                      # CI should run headless
+          DRY_RUN: "true"                       # flip to "false" to apply changes live
+          DEBUG_API: "0"
+          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"  # adjust as you like
+          # ALLOW_DSP_IDS: ""                   # optional IDs list
+        run: node run-qps-autopilot.js
+
+      # Upload artifacts (snapshot + actions CSVs)
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qps-bot-output
+          path: output/**
+          if-no-files-found: warn
+          retention-days: 7
