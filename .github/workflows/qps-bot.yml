@@ -2,7 +2,7 @@ name: QPS Autopilot (hourly)
 
 on:
   schedule:
-    - cron: "5 * * * *"        # every hour at :05 UTC
+    - cron: "5 * * * *"     # every hour at :05 UTC
   workflow_dispatch:
 
 permissions:
@@ -29,14 +29,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # ensure a package.json exists
+          # ensure a package.json exists (repo is scripts-first)
           if [ ! -f package.json ]; then
             npm init -y
           fi
-          # install dotenv for require('dotenv').config()
+          # deps used by run-qps-autopilot.js
           npm install dotenv
-          # install Playwright + Chromium and system deps
           npm install playwright@latest
+          # install Chromium + Linux system deps on the runner
           npx playwright install --with-deps chromium
 
       - name: Create login file from secrets
@@ -46,14 +46,23 @@ jobs:
 
       - name: Run QPS autopilot (DRY RUN)
         env:
+          # ——— Core config ———
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
-          HEADLESS: "true"          # headless in CI
-          DRY_RUN: "true"          # flip to "true" for dry-run
-          DEBUG_API: "0"            # set "1" if you need API debug logs
-          ALLOW_DSPS: "ALL"         # <— act on ALL
-          EXCLUDE_DSPS: "Magnite"   # <— except Magnite
-          # ALLOW_DSP_IDS: "15,184,320"   # optional include-by-ID
-          # EXCLUDE_DSP_IDS: "999"        # optional exclude-by-ID
+          HEADLESS: "true"           # CI should use headless
+          DRY_RUN: "true"            # set to "false" to actually save changes
+          DEBUG_API: "0"             # "1" for verbose API logs
+
+          # ——— Targeting ———
+          ALLOW_DSPS: "ALL"          # operate on ALL…
+          EXCLUDE_DSPS: "Magnite"    # …but exclude Magnite by name
+          # ALLOW_DSP_IDS: "15,184,320"   # optional allowlist by IDs
+          # EXCLUDE_DSP_IDS: "999"        # optional blocklist by IDs
+
+          # ——— Robustness (timeouts/retries) ———
+          ENDPOINT_TIMEOUT_MS: "20000"    # max time to open an edit page
+          FIELD_TIMEOUT_MS:    "15000"    # wait for #max_qps_limit to appear
+          ENDPOINT_RETRIES:    "2"        # retries for open/save/verify
+          FAIL_ON_ITEM_ERROR:  "false"    # keep run green even if some items fail
         run: node run-qps-autopilot.js
 
       - name: Upload artifacts (snapshots/actions)
