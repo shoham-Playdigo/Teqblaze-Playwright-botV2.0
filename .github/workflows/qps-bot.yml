@@ -48,7 +48,7 @@ jobs:
         env:
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
           HEADLESS: "true"          # headless in CI
-          DRY_RUN: "true"           # flip to "false" to apply changes
+          DRY_RUN: "false"           # flip to "false" to apply changes
           DEBUG_API: "0"            # set "1" if you need API debug logs
           ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"
           # ALLOW_DSP_IDS: "15,184,320"
