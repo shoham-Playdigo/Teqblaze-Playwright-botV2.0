@@ -34,6 +34,12 @@ const SAT_QPS_PCT     = 0.70; // ≥70% of limit is “saturated”
 const UP_PCT          = 1.15; // +15%
 const DOWN_PCT        = 0.85; // −15%
 
+// New: timeouts/retries & behavior toggles
+const ENDPOINT_TIMEOUT_MS = Number(process.env.ENDPOINT_TIMEOUT_MS || 20000);
+const FIELD_TIMEOUT_MS    = Number(process.env.FIELD_TIMEOUT_MS    || 15000);
+const ENDPOINT_RETRIES    = Number(process.env.ENDPOINT_RETRIES    || 2);
+const FAIL_ON_ITEM_ERROR  = String(process.env.FAIL_ON_ITEM_ERROR  || 'false') === 'true';
+
 const OUT_DIR = path.join(process.cwd(), 'output');
 function ensureOutDir(){ if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR,{recursive:true}); }
 
@@ -166,7 +172,7 @@ function decideNewLimit({srcpm,qps,current}){
 
 // ====== Playwright helpers ======
 async function uiLogin(page,email,password){
-  await page.goto(`${BASE_URL}/login`,{waitUntil:'domcontentloaded'});
+  await page.goto(`${BASE_URL}/login`,{waitUntil:'domcontentloaded', timeout: ENDPOINT_TIMEOUT_MS});
   await page.getByRole('textbox',{name:'Email'}).fill(email);
   await page.getByRole('textbox',{name:'Password'}).fill(password);
   await page.getByRole('button',{name:/sign in/i}).click();
@@ -175,7 +181,7 @@ async function uiLogin(page,email,password){
 }
 async function qpsInput(page) {
   const input = page.locator('#max_qps_limit');
-  await input.waitFor({ state:'visible', timeout:15000 });
+  await input.waitFor({ state:'visible', timeout: FIELD_TIMEOUT_MS });
   return input;
 }
 async function readCurrentLimit(page){
@@ -215,7 +221,7 @@ async function findExactSaveButton(page) {
 }
 async function waitEnabledAndClick(page, btn) {
   await btn.scrollIntoViewIfNeeded().catch(()=>{});
-  await btn.waitFor({ state:'visible', timeout:4000 }).catch(()=>{});
+  await btn.waitFor({ state:'visible', timeout: 4000 }).catch(()=>{});
   try {
     const handle = await btn.elementHandle();
     await page.waitForFunction(
@@ -234,25 +240,25 @@ async function waitEnabledAndClick(page, btn) {
 }
 async function openDspEdit(page, dspId) {
   const url = `${BASE_URL}/ad-exchange/dsp/${encodeURIComponent(dspId)}/edit`;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= ENDPOINT_RETRIES; attempt++) {
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: ENDPOINT_TIMEOUT_MS });
     } catch (err) {
       if (!String(err).includes('ERR_ABORTED')) throw err;
     }
-    await page.waitForURL(/\/ad-exchange\/dsp\/\d+\/edit/i, { timeout: 20000 }).catch(()=>{});
+    await page.waitForURL(/\/ad-exchange\/dsp\/\d+\/edit/i, { timeout: ENDPOINT_TIMEOUT_MS }).catch(()=>{});
     try {
       await qpsInput(page);
-      return;
+      return; // success
     } catch (e) {
-      if (attempt === 2) throw e;
+      if (attempt === ENDPOINT_RETRIES) throw e;
       await page.waitForTimeout(1200);
     }
   }
 }
 async function saveAndVerify(page, dspId, expected) {
   const saveBtn = await findExactSaveButton(page);
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= ENDPOINT_RETRIES; attempt++) {
     const want = await setQpsAndGetEffective(page, expected);
     await waitEnabledAndClick(page, saveBtn);
     await openDspEdit(page, dspId);
@@ -263,7 +269,7 @@ async function saveAndVerify(page, dspId, expected) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const shot = path.join(OUT_DIR, `after-save-failed-${ts}.png`);
   await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-  throw new Error(`Save did not persist after 3 attempts. Screenshot: ${shot}`);
+  throw new Error(`Save did not persist after ${ENDPOINT_RETRIES} attempts. Screenshot: ${shot}`);
 }
 
 // ====== Main ======
@@ -330,6 +336,7 @@ async function saveAndVerify(page, dspId, expected) {
   const context = await browser.newContext();
   const page = await context.newPage();
   const actions = [];
+  const errors = [];
 
   try {
     await uiLogin(page, creds.email, creds.password);
@@ -340,55 +347,90 @@ async function saveAndVerify(page, dspId, expected) {
 
       console.log(`\n→ ${r.dsp_company} [${dspId}] srcpm=${r.dsp_srcpm} qps=${Number(r.qps).toFixed(2)}  URL: ${BASE_URL}/ad-exchange/dsp/${dspId}/edit`);
 
-      await openDspEdit(page, dspId);
+      // ===== per-item try/catch so we SKIP on timeouts/errors
+      try {
+        await openDspEdit(page, dspId);
 
-      const current = await readCurrentLimit(page);
-      const decision = decideNewLimit({ srcpm: Number(r.dsp_srcpm), qps: Number(r.qps), current });
-      const saturation = current > 0 ? (Number(r.qps) / current) * 100 : 0;
+        const current = await readCurrentLimit(page);
+        const decision = decideNewLimit({ srcpm: Number(r.dsp_srcpm), qps: Number(r.qps), current });
+        const saturation = current > 0 ? (Number(r.qps) / current) * 100 : 0;
 
-      let wouldSaveValue = '';
-      if (DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
-        wouldSaveValue = await setQpsAndGetEffective(page, decision.newLimit);
-        console.log(`   [DRY RUN] current=${current} → proposed=${decision.newLimit} → UI shows ${wouldSaveValue} (${decision.reason})`);
-      } else if (!DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
-        await saveAndVerify(page, dspId, decision.newLimit);
-        const saved = await readCurrentLimit(page);
-        console.log(`   savedLimit=${saved}`);
-        wouldSaveValue = saved;
-      } else {
-        console.log('   No change.');
+        let wouldSaveValue = '';
+        if (DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
+          wouldSaveValue = await setQpsAndGetEffective(page, decision.newLimit);
+          console.log(`   [DRY RUN] current=${current} → proposed=${decision.newLimit} → UI shows ${wouldSaveValue} (${decision.reason})`);
+        } else if (!DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
+          await saveAndVerify(page, dspId, decision.newLimit);
+          const saved = await readCurrentLimit(page);
+          console.log(`   savedLimit=${saved}`);
+          wouldSaveValue = saved;
+        } else {
+          console.log('   No change.');
+        }
+
+        actions.push({
+          dsp_id: dspId,
+          dsp_company: r.dsp_company,
+          srcpm: r.dsp_srcpm,
+          qps: Number(r.qps?.toFixed?.(2)),
+          current_limit: current,
+          proposed_limit: decision.newLimit,
+          would_save_value: wouldSaveValue,
+          saturation_pct: Number.isFinite(saturation) ? Number(saturation.toFixed(1)) : '',
+          action: decision.action,
+          reason: decision.reason,
+          error: ''
+        });
+
+      } catch (err) {
+        const msg = (err && err.message) ? err.message : String(err);
+        console.warn(`   ⚠ Skipping ${dspId} due to error: ${msg}`);
+
+        errors.push({ dsp_id: dspId, err: msg });
+
+        actions.push({
+          dsp_id: dspId,
+          dsp_company: r.dsp_company,
+          srcpm: r.dsp_srcpm,
+          qps: Number(r.qps?.toFixed?.(2)),
+          current_limit: '',
+          proposed_limit: '',
+          would_save_value: '',
+          saturation_pct: '',
+          action: 'skipped_error',
+          reason: 'endpoint timeout/error',
+          error: msg
+        });
+
+        // continue to next item
+        continue;
       }
-
-      actions.push({
-        dsp_id: dspId,
-        dsp_company: r.dsp_company,
-        srcpm: r.dsp_srcpm,
-        qps: Number(r.qps?.toFixed?.(2)),
-        current_limit: current,
-        proposed_limit: decision.newLimit,
-        would_save_value: wouldSaveValue,
-        saturation_pct: Number.isFinite(saturation) ? Number(saturation.toFixed(1)) : '',
-        action: decision.action,
-        reason: decision.reason
-      });
     }
   } finally {
     await page.close(); await context.close(); await browser.close();
   }
 
-  // Audit CSV
+  // Audit CSV (includes skipped_error rows)
   const actHeader = [
     'dsp_id','dsp_company','srcpm','qps',
     'current_limit','proposed_limit','would_save_value','saturation_pct',
-    'action','reason'
+    'action','reason','error'
   ];
   const actPath = path.join(OUT_DIR, `actions-${new Date().toISOString().replace(/[:.]/g,'-')}.csv`);
+  const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;
   fs.writeFileSync(actPath, '\uFEFF'+[
     actHeader.join(','),
     ...actions.map(a => actHeader.map(k => esc(a[k])).join(','))
   ].join('\n'), 'utf8');
   console.log(`\n✅ Actions (DRY_RUN=${DRY_RUN}) → ${actPath}`);
+
+  if (FAIL_ON_ITEM_ERROR && errors.length) {
+    console.error(`Encountered ${errors.length} item error(s). Failing as requested (FAIL_ON_ITEM_ERROR=true).`);
+    process.exit(1);
+  }
+  // otherwise finish successfully
+  process.exit(0);
 })().catch(err=>{
-  console.error('Error:', err.message||err);
+  console.error('Fatal error:', err.message||err);
   process.exit(1);
 });
