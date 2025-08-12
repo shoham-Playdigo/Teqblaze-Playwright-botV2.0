@@ -2,7 +2,7 @@ name: QPS Autopilot (hourly)
 
 on:
   schedule:
-    - cron: "5 * * * *"   # run at minute 5 every hour (UTC)
+    - cron: "5 * * * *"        # every hour at :05 UTC
   workflow_dispatch:
 
 permissions:
@@ -25,14 +25,17 @@ jobs:
         with:
           node-version: 22
 
-      # Make the runner self-sufficient (no package.json required)
-      - name: Install Playwright + Chromium deps
+      - name: Install deps (dotenv + Playwright)
         shell: bash
         run: |
           set -euxo pipefail
+          # ensure a package.json exists
           if [ ! -f package.json ]; then
             npm init -y
           fi
+          # install dotenv for require('dotenv').config()
+          npm install dotenv
+          # install Playwright + Chromium and system deps
           npm install playwright@latest
           npx playwright install --with-deps chromium
 
@@ -43,13 +46,12 @@ jobs:
 
       - name: Run QPS autopilot (DRY RUN)
         env:
-          # Your environment
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
-          HEADLESS: "true"             # CI must run headless
-          DRY_RUN: "true"              # set to "false" to apply changes
-          DEBUG_API: "0"               # set to "1" only when debugging token/API
-          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn" # or "ALL"
-          # ALLOW_DSP_IDS: "15,184,320" # optional numeric allow-list
+          HEADLESS: "true"          # headless in CI
+          DRY_RUN: "true"           # flip to "false" to apply changes
+          DEBUG_API: "0"            # set "1" if you need API debug logs
+          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"
+          # ALLOW_DSP_IDS: "15,184,320"
         run: node run-qps-autopilot.js
 
       - name: Upload artifacts (snapshots/actions)
