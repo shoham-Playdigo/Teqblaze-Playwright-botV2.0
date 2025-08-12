@@ -1,0 +1,12 @@
+{
+  "name": "teqblaze-qps-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node run-qps-autopilot.js"
+  },
+  "dependencies": {
+    "playwright": "^1.45.0"
+  }
+}
