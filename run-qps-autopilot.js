@@ -1,33 +1,38 @@
 'use strict';
-require('dotenv').config();
+try { require('dotenv').config(); } catch {}
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { chromium, request: pwRequest } = require('playwright');
+const { chromium } = require('playwright');
 
 // ====== ENV / constants ======
 const BASE_URL  = (process.env.TEQ_BASE_URL || 'https://ssp.playdigo.com').replace(/\/+$/, '');
-const HEADLESS  = String(process.env.HEADLESS || 'false').toLowerCase() !== 'false'; // default: visible
+const HEADLESS  = String(process.env.HEADLESS || 'false').toLowerCase() !== 'false'; // default visible
 const DRY_RUN   = String(process.env.DRY_RUN  || 'true').toLowerCase() === 'true';
 const DEBUG_API = String(process.env.DEBUG_API|| '0') === '1';
 
-// Allow-list by name (case/punct insensitive) or ALL
+// ALLOW by names (or ALL), and EXCLUDE by names/IDs
 const RAW_ALLOW = (process.env.ALLOW_DSPS || 'ALL').trim();
 const ALLOW_MODE_ALL = RAW_ALLOW === '' || /^all$/i.test(RAW_ALLOW) || RAW_ALLOW === '*';
 const ALLOW_DSPS = ALLOW_MODE_ALL ? [] : RAW_ALLOW.split(',').map(s => s.trim()).filter(Boolean);
+
+const EXCLUDE_DSPS = (process.env.EXCLUDE_DSPS || 'Magnite')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const EXCLUDE_DSP_IDS = (process.env.EXCLUDE_DSP_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 // Optional allow-list by IDs
 const ALLOW_DSP_IDS = (process.env.ALLOW_DSP_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Business rules
-const CAP_MAX = 30000;
-const FLOOR_MIN = 500;
+const CAP_MAX         = 30000;
+const FLOOR_MIN       = 500;
 const CRITICAL_SET_TO = 100;
-const SAT_QPS_PCT = 0.70; // ≥70% of limit is “saturated”
-const UP_PCT = 1.15;      // +15%
-const DOWN_PCT = 0.85;    // −15%
+const SAT_QPS_PCT     = 0.70; // ≥70% of limit is “saturated”
+const UP_PCT          = 1.15; // +15%
+const DOWN_PCT        = 0.85; // −15%
 
 const OUT_DIR = path.join(process.cwd(), 'output');
 function ensureOutDir(){ if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR,{recursive:true}); }
@@ -37,7 +42,7 @@ const num = s => Number(String(s ?? '').replace(/[^\d.-]/g, ''));
 
 // ====== tiny utils ======
 function lastFullHourInfo() {
-  const d = new Date(Date.now() - 60 * 60 * 1000); // N-1 hour in UTC
+  const d = new Date(Date.now() - 60 * 60 * 1000); // N-1 hour UTC
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
@@ -165,12 +170,9 @@ async function uiLogin(page,email,password){
   await page.getByRole('textbox',{name:'Email'}).fill(email);
   await page.getByRole('textbox',{name:'Password'}).fill(password);
   await page.getByRole('button',{name:/sign in/i}).click();
-  // don't block forever on "load"; wait for a stable point
   await page.waitForLoadState('domcontentloaded').catch(()=>{});
-  // tiny pause to let SPA init
   await page.waitForTimeout(500);
 }
-
 async function qpsInput(page) {
   const input = page.locator('#max_qps_limit');
   await input.waitFor({ state:'visible', timeout:15000 });
@@ -230,40 +232,32 @@ async function waitEnabledAndClick(page, btn) {
     page.waitForLoadState('domcontentloaded')
   ]);
 }
-
-// NEW: robust opener that tolerates ERR_ABORTED, waits on URL + selector, retries once
 async function openDspEdit(page, dspId) {
   const url = `${BASE_URL}/ad-exchange/dsp/${encodeURIComponent(dspId)}/edit`;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch (err) {
-      if (!String(err).includes('ERR_ABORTED')) throw err; // only ignore the known race
+      if (!String(err).includes('ERR_ABORTED')) throw err;
     }
-    // If app does a soft redirect, make sure we're on the right route
     await page.waitForURL(/\/ad-exchange\/dsp\/\d+\/edit/i, { timeout: 20000 }).catch(()=>{});
     try {
-      await qpsInput(page); // confirm the field is present
-      return;               // success
+      await qpsInput(page);
+      return;
     } catch (e) {
       if (attempt === 2) throw e;
       await page.waitForTimeout(1200);
     }
   }
 }
-
 async function saveAndVerify(page, dspId, expected) {
-  const editUrl = `${BASE_URL}/ad-exchange/dsp/${encodeURIComponent(dspId)}/edit`;
   const saveBtn = await findExactSaveButton(page);
   for (let attempt = 1; attempt <= 3; attempt++) {
     const want = await setQpsAndGetEffective(page, expected);
     await waitEnabledAndClick(page, saveBtn);
-
-    // Re-open robustly (instead of a bare goto)
     await openDspEdit(page, dspId);
-
     const after = await readCurrentLimit(page);
-    if (after === want) return; // success
+    if (after === want) return;
     console.log(`(attempt ${attempt}) UI showed ${want} but after reload saw ${after} — retrying...`);
   }
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -283,7 +277,7 @@ async function saveAndVerify(page, dspId, expected) {
     process.exit(0);
   }
 
-  // Snapshot CSV for transparency
+  // Snapshot CSV
   const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;
   const snapHeader = ['hour_utc','dsp_company','dsp_id','qps','bid_requests','dsp_srcpm'];
   const snapPath = path.join(OUT_DIR, `last-hour-snapshot-${hourKey.replace(/[: ]/g,'-')}.csv`);
@@ -297,8 +291,10 @@ async function saveAndVerify(page, dspId, expected) {
   );
   console.log(`Snapshot → ${snapPath}`);
 
-  // Allow filtering
+  // ===== Filtering =====
   let rows = items.slice();
+
+  // 1) ALLOW (optional)
   if (!ALLOW_MODE_ALL) {
     const allowedNorms = ALLOW_DSPS.map(normName);
     rows = rows.filter(r => {
@@ -310,8 +306,22 @@ async function saveAndVerify(page, dspId, expected) {
     const idSet = new Set(ALLOW_DSP_IDS.map(String));
     rows = rows.filter(r => idSet.has(String(r.dsp_id)));
   }
+
+  // 2) EXCLUDE (names + ids)
+  if (EXCLUDE_DSPS.length) {
+    const exclNorms = EXCLUDE_DSPS.map(normName);
+    rows = rows.filter(r => {
+      const n = normName(r.dsp_company);
+      return !exclNorms.some(x => n.includes(x) || x.includes(n));
+    });
+  }
+  if (EXCLUDE_DSP_IDS.length) {
+    const badIds = new Set(EXCLUDE_DSP_IDS.map(String));
+    rows = rows.filter(r => !badIds.has(String(r.dsp_id)));
+  }
+
   if (!rows.length) {
-    console.log('No rows matched filters (ALLOW_DSPS/ALLOW_DSP_IDS). Exiting.');
+    console.log('No rows matched filters after excludes. Exiting.');
     process.exit(0);
   }
 
@@ -330,7 +340,6 @@ async function saveAndVerify(page, dspId, expected) {
 
       console.log(`\n→ ${r.dsp_company} [${dspId}] srcpm=${r.dsp_srcpm} qps=${Number(r.qps).toFixed(2)}  URL: ${BASE_URL}/ad-exchange/dsp/${dspId}/edit`);
 
-      // Robust open
       await openDspEdit(page, dspId);
 
       const current = await readCurrentLimit(page);
@@ -339,7 +348,6 @@ async function saveAndVerify(page, dspId, expected) {
 
       let wouldSaveValue = '';
       if (DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
-        // Type into the field to see UI normalization/validation, but DO NOT save.
         wouldSaveValue = await setQpsAndGetEffective(page, decision.newLimit);
         console.log(`   [DRY RUN] current=${current} → proposed=${decision.newLimit} → UI shows ${wouldSaveValue} (${decision.reason})`);
       } else if (!DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
@@ -368,7 +376,7 @@ async function saveAndVerify(page, dspId, expected) {
     await page.close(); await context.close(); await browser.close();
   }
 
-  // Audit CSV (includes proposed & would_save_value)
+  // Audit CSV
   const actHeader = [
     'dsp_id','dsp_company','srcpm','qps',
     'current_limit','proposed_limit','would_save_value','saturation_pct',
