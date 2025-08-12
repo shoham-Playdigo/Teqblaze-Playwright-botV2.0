@@ -2,8 +2,8 @@ name: QPS Autopilot (hourly)
 
 on:
   schedule:
-    - cron: "5 * * * *"   # runs at minute 5 past every hour (UTC)
-  workflow_dispatch:       # manual runs
+    - cron: "5 * * * *"   # run at minute 5 every hour (UTC)
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,13 +23,22 @@ jobs:
         with:
           node-version: 22
 
-      # Install Playwright and Chromium with system deps
+      # Create package.json if missing, then install Playwright & Chromium deps
       - name: Install Playwright
+        shell: bash
         run: |
-          npm ci || npm i
+          set -euxo pipefail
+          if [ ! -f package.json ]; then
+            npm init -y
+          fi
+          npm install playwright@latest
           npx playwright install --with-deps chromium
 
-      # Create the 'login' file from repo secrets (not committed)
+      # Quick sanity: show files so we can confirm the repo contents
+      - name: List repo
+        run: ls -la
+
+      # Create the 'login' file from repo secrets (do NOT commit this file)
       - name: Create login file
         run: |
           printf "%s\n%s\n" "${{ secrets.TEQ_EMAIL }}" "${{ secrets.TEQ_PASSWORD }}" > login
@@ -41,11 +50,11 @@ jobs:
           HEADLESS: "true"                      # CI should run headless
           DRY_RUN: "true"                       # flip to "false" to apply changes live
           DEBUG_API: "0"
-          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"  # adjust as you like
-          # ALLOW_DSP_IDS: ""                   # optional IDs list
+          ALLOW_DSPS: "FreeWheel, Loop-Me, Sovrn"
+          # ALLOW_DSP_IDS: ""                   # optional IDs: e.g. "15,400,1234"
         run: node run-qps-autopilot.js
 
-      # Upload artifacts (snapshot + actions CSVs)
+      # Upload outputs (snapshot + actions CSVs)
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
