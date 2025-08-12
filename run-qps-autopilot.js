@@ -43,6 +43,9 @@ const FAIL_ON_ITEM_ERROR  = String(process.env.FAIL_ON_ITEM_ERROR  || 'false') =
 const OUT_DIR = path.join(process.cwd(), 'output');
 function ensureOutDir(){ if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR,{recursive:true}); }
 
+// CSV escape helper (define ONCE)
+const csvEsc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+
 const normName = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,''); // remove spaces/punct
 const num = s => Number(String(s ?? '').replace(/[^\d.-]/g, ''));
 
@@ -284,14 +287,13 @@ async function saveAndVerify(page, dspId, expected) {
   }
 
   // Snapshot CSV
-  const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;
   const snapHeader = ['hour_utc','dsp_company','dsp_id','qps','bid_requests','dsp_srcpm'];
   const snapPath = path.join(OUT_DIR, `last-hour-snapshot-${hourKey.replace(/[: ]/g,'-')}.csv`);
   fs.writeFileSync(
     snapPath,
     '\uFEFF'+[snapHeader.join(','), ...items.map(r =>
       [r.hour_utc, r.dsp_company, r.dsp_id, (Number.isFinite(r.qps)? r.qps.toFixed(3):''), r.bid_requests, r.dsp_srcpm]
-        .map(esc).join(',')
+        .map(csvEsc).join(',')
     )].join('\n'),
     'utf8'
   );
@@ -417,10 +419,9 @@ async function saveAndVerify(page, dspId, expected) {
     'action','reason','error'
   ];
   const actPath = path.join(OUT_DIR, `actions-${new Date().toISOString().replace(/[:.]/g,'-')}.csv`);
-  const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;
   fs.writeFileSync(actPath, '\uFEFF'+[
     actHeader.join(','),
-    ...actions.map(a => actHeader.map(k => esc(a[k])).join(','))
+    ...actions.map(a => actHeader.map(k => csvEsc(a[k])).join(','))
   ].join('\n'), 'utf8');
   console.log(`\n✅ Actions (DRY_RUN=${DRY_RUN}) → ${actPath}`);
 
