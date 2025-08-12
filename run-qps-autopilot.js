@@ -1,296 +1,386 @@
-/**
- * Teqblaze QPS Autopilot (DRY-RUN by default)
- * --------------------------------------------------
- * - Fetches last full hour (UTC) DSP stats via API
- * - Filters to allowed vendors / ids
- * - Computes QPS = bid_requests / 3600
- * - Logs plan + (optionally) changes QPS limit in UI via Playwright
- *
- * Auth:
- *  - In CI: set repo secrets TEQ_EMAIL, TEQ_PASSWORD
- *  - Locally: either env vars or a "login" file with two lines (email\npassword)
- */
+'use strict';
+require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
+const https = require('https');
+const { chromium, request: pwRequest } = require('playwright');
 
-// --------- config from env ---------
-const BASE = process.env.TEQ_BASE_URL || 'https://ssp.playdigo.com';
-const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
-const HEADLESS = (process.env.HEADLESS || 'true').toLowerCase() === 'true';
-const DEBUG_API = (process.env.DEBUG_API || '0') === '1';
+// ====== ENV / constants ======
+const BASE_URL  = (process.env.TEQ_BASE_URL || 'https://ssp.playdigo.com').replace(/\/+$/, '');
+const HEADLESS  = String(process.env.HEADLESS || 'false').toLowerCase() !== 'false'; // default: visible
+const DRY_RUN   = String(process.env.DRY_RUN  || 'true').toLowerCase() === 'true';
+const DEBUG_API = String(process.env.DEBUG_API|| '0') === '1';
 
-const ALLOW_DSPS = (process.env.ALLOW_DSPS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);                          // e.g. "FreeWheel, Loop-Me, Sovrn"
+// Allow-list by name (case/punct insensitive) or ALL
+const RAW_ALLOW = (process.env.ALLOW_DSPS || 'ALL').trim();
+const ALLOW_MODE_ALL = RAW_ALLOW === '' || /^all$/i.test(RAW_ALLOW) || RAW_ALLOW === '*';
+const ALLOW_DSPS = ALLOW_MODE_ALL ? [] : RAW_ALLOW.split(',').map(s => s.trim()).filter(Boolean);
 
+// Optional allow-list by IDs
 const ALLOW_DSP_IDS = (process.env.ALLOW_DSP_IDS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);                          // e.g. "15,400,1234"
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-// limits / rules
-const MAX_LIMIT = 30000;
-const MIN_LIMIT = 500;
-const LOW_SRCPM_HARD = 0.005;                // set 100
-const LOW_SRCPM_SOFT = 0.25;                 // decrease 15%
-const HIGH_SRCPM = 0.55;                     // increase 15% if QPS >= 70% limit
-const INCREASE_FACTOR = 1.15;
-const DECREASE_FACTOR = 0.85;
+// Business rules
+const CAP_MAX = 30000;
+const FLOOR_MIN = 500;
+const CRITICAL_SET_TO = 100;
+const SAT_QPS_PCT = 0.70; // ≥70% of limit is “saturated”
+const UP_PCT = 1.15;      // +15%
+const DOWN_PCT = 0.85;    // −15%
 
-// --------- utilities ---------
-function utcNow() { return new Date(new Date().toISOString()); }
-function pad(n) { return n.toString().padStart(2, '0'); }
+const OUT_DIR = path.join(process.cwd(), 'output');
+function ensureOutDir(){ if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR,{recursive:true}); }
 
-function lastFullHourUTC() {
-  const d = utcNow();
-  d.setUTCMinutes(0, 0, 0);
-  d.setUTCHours(d.getUTCHours() - 1);
-  const Y = d.getUTCFullYear();
-  const M = pad(d.getUTCMonth() + 1);
-  const D = pad(d.getUTCDate());
-  const H = pad(d.getUTCHours());
-  return {
-    date: `${Y}-${M}-${D}`,
-    hourStamp: `${Y}-${M}-${D} ${H}:00:00`,
-    hour: H,
-    isoTag: `${Y}-${M}-${D}T${H}-00-00Z`
-  };
+const normName = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,''); // remove spaces/punct
+const num = s => Number(String(s ?? '').replace(/[^\d.-]/g, ''));
+
+// ====== tiny utils ======
+function lastFullHourInfo() {
+  const d = new Date(Date.now() - 60 * 60 * 1000); // N-1 hour in UTC
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  return { ymd: `${y}-${m}-${day}`, hourKey: `${y}-${m}-${day} ${hh}:00` };
 }
-
-function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
-
-function csv(rows) {
-  if (!rows.length) return '';
-  const keys = Object.keys(rows[0]);
-  const esc = v => (v == null ? '' :
-    String(v).replace(/"/g, '""'));
-  const lines = [keys.join(',')];
-  for (const r of rows) {
-    lines.push(keys.map(k => `"${esc(r[k])}"`).join(','));
-  }
-  return lines.join('\n');
+function readLogin(){
+  const raw = fs.readFileSync('login','utf8').replace(/\r/g,'').trim();
+  const [email,password] = raw.split('\n').map(s=>s.trim());
+  if(!email||!password) throw new Error('login file must have 2 lines: email then password');
+  return {email,password};
 }
-
-function readLogin() {
-  const email = process.env.TEQ_EMAIL;
-  const password = process.env.TEQ_PASSWORD;
-  if (email && password) return { email, password };
-
-  const f = path.resolve('login');
-  if (fs.existsSync(f)) {
-    const [e, p] = fs.readFileSync(f, 'utf8').split(/\r?\n/);
-    if (e && p) return { email: e.trim(), password: p.trim() };
-  }
-  throw new Error('Missing credentials: set TEQ_EMAIL/TEQ_PASSWORD or create a "login" file.');
-}
-
-// --------- API helpers ---------
-async function apiFetch(url, opts = {}) {
-  if (DEBUG_API) console.log('API GET:', url);
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  if (DEBUG_API) console.log(' ->', res.status, text.slice(0, 200));
-  let json = {};
-  try { json = JSON.parse(text); } catch { /* not json */ }
-  if (!res.ok) {
-    throw new Error(`API ${res.status}: ${url}\n${text}`);
-  }
-  return json;
-}
-
-async function createToken(base, email, password) {
-  const url = `${base}/api/create_token`;
-  if (DEBUG_API) console.log('API POST:', url);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'accept': 'application/json' },
-    body: JSON.stringify({ email, password })
+function httpsRequest(urlStr, { method='GET', headers={}, body=null }={}){
+  return new Promise((resolve,reject)=>{
+    const u = new URL(urlStr);
+    const req = https.request({
+      protocol: u.protocol, hostname: u.hostname, port: u.port || 443,
+      path: u.pathname + u.search, method,
+      headers: { 'accept-encoding': 'identity', ...headers },
+      insecureHTTPParser: true
+    }, res => {
+      const chunks=[]; res.on('data',d=>chunks.push(d));
+      res.on('end',()=>resolve({ ok:res.statusCode>=200&&res.statusCode<300, status:res.statusCode, text:Buffer.concat(chunks).toString('utf8'), headers:res.headers }));
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
   });
-  const json = await res.json();
-  if (!res.ok || !json.token) throw new Error(`Token error: ${res.status} ${JSON.stringify(json)}`);
-  return json.token;
 }
-
-async function fetchHourly(base, token, date) {
-  // day_group=hour; date=YYYY-MM-DD; attributes + metrics; NO time_zone param (some tenants reject it)
-  const params = new URLSearchParams();
-  params.set('day_group', 'hour');
-  params.set('date', date);
-  params.append('attribute[]', 'company_dsp');
-  params.append('attribute[]', 'dsp_id');
-  params.append('metric[]', 'bid_requests');
-  params.append('metric[]', 'dsp_srcpm');
-  params.set('limit', '2000');
-  const url = `${base}/api/${token}/adx-report?${params.toString()}`;
-  const json = await apiFetch(url);
-  return json.data || [];
-}
-
-// --------- Playwright helpers ---------
-async function loginUI(page, email, password) {
-  await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
-  await page.getByRole('textbox', { name: 'Email' }).fill(email);
-  await page.getByRole('textbox', { name: 'Password' }).fill(password);
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await page.waitForLoadState('networkidle');
-}
-
-async function readCurrentLimit(page) {
-  // Prefer the input id if present; fall back to visible number parsing.
-  const field = page.locator('#max_qps_limit');
-  if (await field.count()) {
-    const val = (await field.inputValue() || '').replace(/,/g, '');
-    const n = parseInt(val, 10);
-    if (!Number.isNaN(n)) return n;
+async function createToken(email,password){
+  const url = `${BASE_URL}/api/create_token`;
+  // Try JSON
+  let res = await httpsRequest(url,{ method:'POST', headers:{'content-type':'application/json',accept:'application/json'}, body:JSON.stringify({email,password}) });
+  if(!res.ok){
+    // Fallback to form-encoded
+    res = await httpsRequest(url,{ method:'POST', headers:{'content-type':'application/x-www-form-urlencoded',accept:'application/json'}, body:new URLSearchParams({email,password}).toString() });
   }
-  // fallback: look for any number near "QPS limit"
-  const txt = await page.locator('body').innerText();
-  const m = txt.match(/QPS\s*limit[^0-9]*([\d,]+)/i);
-  if (m) {
-    const n = parseInt(m[1].replace(/,/g, ''), 10);
-    if (!Number.isNaN(n)) return n;
+  if(!res.ok) throw new Error(`create_token failed ${res.status}: ${res.text.slice(0,200)}`);
+  try { const j = JSON.parse(res.text); const t = j.token || j.authenticator || j.key || j?.data?.token; if (t) return t; } catch {}
+  return res.text.trim().replace(/["']/g,'');
+}
+function parseRows(text){
+  try {
+    const j=JSON.parse(text);
+    if (Array.isArray(j)) return j;
+    if (Array.isArray(j.data)) return j.data;
+    if (Array.isArray(j.rows)) return j.rows;
+  } catch {}
+  return null;
+}
+function findKey(obj, candidates) {
+  const norm = s => String(s).toLowerCase().replace(/[\s_-]+/g, '');
+  const map = {}; for (const k of Object.keys(obj || {})) map[norm(k)] = k;
+  for (const want of candidates) { const hit = map[norm(want)]; if (hit) return hit; }
+  return null;
+}
+function extractHourUTC(row) {
+  if (typeof row.date === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:/.test(row.date)) return row.date.slice(0, 13) + ':00';
+  for (const v of Object.values(row)) {
+    if (typeof v === 'string') {
+      const m = v.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2})/);
+      if (m) return `${m[1]} ${m[2]}:00`;
+    }
   }
-  throw new Error('Could not read current QPS limit');
+  const Y=row.Y??row.year, m=row.m??row.month, d=row.d??row.day, H=row.H??row.hour??row.hr??row.h;
+  if (Y && m && d && H) return `${String(Y).padStart(4,'0')}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')} ${String(H).padStart(2,'0')}:00`;
+  if (row.date && (row.hour || row.hr || row.h)) {
+    const day = String(row.date).slice(0,10); const hh = String(row.hour ?? row.hr ?? row.h).padStart(2,'0');
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day)) return `${day} ${hh}:00`;
+  }
+  return '';
 }
 
-async function setLimitAndSave(page, newLimit) {
-  await page.locator('#max_qps_limit').fill(String(newLimit));
-  // Use the plain Save button (avoid "Save & Exit")
-  await page.getByRole('button', { name: /^Save$/ }).click();
-  await page.waitForLoadState('networkidle');
-}
+// ====== API: fetch N-1 hour rows ======
+async function fetchLastHourRows({email,password}){
+  const { ymd, hourKey } = lastFullHourInfo();
+  const token = await createToken(email,password);
 
-// --------- decision logic ---------
-function decideAction({ srcpm, qps, currentLimit }) {
-  // rule order: hard low -> soft low -> high
-  if (srcpm < LOW_SRCPM_HARD) {
-    return { action: 'set', newLimit: 100, rule: 'srcpm<0.005 -> set 100' };
-  }
-  if (srcpm < LOW_SRCPM_SOFT) {
-    const dec = Math.max(MIN_LIMIT, Math.floor(currentLimit * DECREASE_FACTOR));
-    return { action: 'decrease', newLimit: dec, rule: 'srcpm<0.25 -> -15%' };
-  }
-  if (srcpm > HIGH_SRCPM && qps >= 0.7 * currentLimit) {
-    const inc = Math.min(MAX_LIMIT, Math.ceil(currentLimit * INCREASE_FACTOR));
-    return { action: 'increase', newLimit: inc, rule: 'srcpm>0.55 & qps>=70% -> +15%' };
-  }
-  return { action: 'none', newLimit: currentLimit, rule: 'no-change' };
-}
+  const qs = new URLSearchParams({ day_group:'hour', date: ymd, limit: '2000' });
+  qs.append('attribute[]','company_dsp');
+  qs.append('attribute[]','dsp_id');
+  qs.append('metric[]','bid_requests');
+  qs.append('metric[]','dsp_srcpm');
 
-// --------- main ---------
-(async () => {
-  ensureDir('output');
+  const url = `${BASE_URL}/api/${encodeURIComponent(token)}/adx-report?${qs.toString()}`;
+  if (DEBUG_API) console.log('API GET:', url);
 
-  const creds = readLogin();
-  const { date, hourStamp, isoTag } = lastFullHourUTC();
-  console.log(`Fetching hourly report for last full hour UTC → date=${date}, hour=${hourStamp}`);
+  const res = await httpsRequest(url, { headers: { accept: 'application/json' } });
+  if (!res.ok) throw new Error(`adx-report failed ${res.status}: ${res.text.slice(0,200)}`);
+  const rows = parseRows(res.text) || [];
+  if (!rows.length) return { hourKey, items: [] };
 
-  // 1) token + report
-  const token = await createToken(BASE, creds.email, creds.password);
-  const all = await fetchHourly(BASE, token, date);
-  const rowsAtHour = all.filter(r => r.date === hourStamp);
+  const sample = rows[0];
+  const kCompany = findKey(sample, ['company_dsp','company_ssp','dsp_company','company','dsp_name']);
+  const kId      = findKey(sample, ['dsp_id','id','dspId']);
+  const kReq     = findKey(sample, ['bid_requests','bids','requests']);
+  const kSrcpm   = findKey(sample, ['dsp_srcpm','srcpm','eCPM','rpm']);
 
-  // prepare snapshot
-  const snapshot = rowsAtHour.map(r => ({
-    hour_utc: hourStamp,
-    company_dsp: r.company_dsp,
-    dsp_id: r.dsp_id,
-    bid_requests: r.bid_requests,
-    dsp_srcpm: r.dsp_srcpm,
-    qps: (r.bid_requests || 0) / 3600
+  const normalized = rows.map(r => ({
+    hour_utc:   extractHourUTC(r),
+    dsp_company: kCompany ? r[kCompany] : '',
+    dsp_id:      kId ? r[kId] : '',
+    bid_requests: kReq ? Number(r[kReq]) : NaN,
+    dsp_srcpm:   kSrcpm ? Number(r[kSrcpm]) : NaN
   }));
 
-  // filter by vendors / ids
-  const allowSet = new Set(ALLOW_DSPS.map(s => s.toLowerCase()));
-  const idSet = new Set(ALLOW_DSP_IDS);
-  let targets = snapshot.filter(r =>
-    (allowSet.size ? allowSet.has(String(r.company_dsp || '').toLowerCase()) : true) ||
-    (idSet.size ? idSet.has(String(r.dsp_id)) : false)
-  );
+  // Filter to last full hour and compute QPS
+  const last = normalized.filter(r => r.hour_utc === hourKey)
+                        .map(r => ({ ...r, qps: Number.isFinite(r.bid_requests) ? r.bid_requests/3600 : NaN }));
+  return { hourKey, items: last };
+}
 
-  // If neither list supplied, act on all (or comment to require one)
-  // if (!ALLOW_DSPS.length && !ALLOW_DSP_IDS.length) targets = [];
+// ====== Decision rules ======
+function decideNewLimit({srcpm,qps,current}){
+  if (srcpm < 0.005) return { action:'set',      newLimit:CRITICAL_SET_TO,                                  reason:'srcpm<0.005→set100' };
+  if (srcpm < 0.25)  return { action:'decrease', newLimit:Math.max(FLOOR_MIN, Math.floor(current*DOWN_PCT)), reason:'srcpm<0.25→-15%'   };
+  if (srcpm > 0.55 && qps >= SAT_QPS_PCT*current)
+                     return { action:'increase', newLimit:Math.min(CAP_MAX, Math.round(current*UP_PCT)),     reason:'srcpm>0.55 & qps>=70%→+15%' };
+  return { action:'hold', newLimit:current, reason:'no-change' };
+}
 
-  // write snapshot
-  const snapFile = path.join('output', `last-hour-snapshot-${isoTag}.csv`);
-  fs.writeFileSync(snapFile, csv(snapshot));
-  console.log(`Snapshot → ${snapFile} (${snapshot.length} rows)`);
+// ====== Playwright helpers ======
+async function uiLogin(page,email,password){
+  await page.goto(`${BASE_URL}/login`,{waitUntil:'domcontentloaded'});
+  await page.getByRole('textbox',{name:'Email'}).fill(email);
+  await page.getByRole('textbox',{name:'Password'}).fill(password);
+  await page.getByRole('button',{name:/sign in/i}).click();
+  // don't block forever on "load"; wait for a stable point
+  await page.waitForLoadState('domcontentloaded').catch(()=>{});
+  // tiny pause to let SPA init
+  await page.waitForTimeout(500);
+}
 
-  if (!targets.length) {
-    console.log('No rows matched filters. Exiting.');
-    return;
+async function qpsInput(page) {
+  const input = page.locator('#max_qps_limit');
+  await input.waitFor({ state:'visible', timeout:15000 });
+  return input;
+}
+async function readCurrentLimit(page){
+  return num(await (await qpsInput(page)).inputValue());
+}
+async function setQpsAndGetEffective(page, desired) {
+  const input = await qpsInput(page);
+  await input.click({ clickCount: 3 });
+  await input.press('Backspace');
+  await input.type(String(desired), { delay: 10 });
+  const handle = await input.elementHandle();
+  await handle.evaluate((el, val) => {
+    el.value = String(val);
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+  }, desired);
+  await input.press('Tab');
+  await page.waitForTimeout(300);
+  return num(await input.inputValue());
+}
+async function findExactSaveButton(page) {
+  let btn = page.getByRole('button', { name: /^save$/i }).first();
+  if (await btn.count() && await btn.isVisible()) return btn;
+  const buttons = page.locator('button');
+  const n = await buttons.count();
+  for (let i = 0; i < n; i++) {
+    const el = buttons.nth(i);
+    if (!(await el.isVisible())) continue;
+    const text = (await el.innerText()).trim();
+    if (/^save$/i.test(text)) return el;
+    if (/save/i.test(text) && !/exit/i.test(text)) return el;
+  }
+  const any = page.getByText(/^save$/i).first();
+  if (await any.count() && await any.isVisible()) return any;
+  throw new Error('Exact "SAVE" button not found.');
+}
+async function waitEnabledAndClick(page, btn) {
+  await btn.scrollIntoViewIfNeeded().catch(()=>{});
+  await btn.waitFor({ state:'visible', timeout:4000 }).catch(()=>{});
+  try {
+    const handle = await btn.elementHandle();
+    await page.waitForFunction(
+      el => !!el && !el.disabled && el.getAttribute('aria-disabled') !== 'true',
+      handle, { timeout: 4000 }
+    );
+  } catch {}
+  try { await btn.click({ timeout: 8000 }); }
+  catch { await page.waitForTimeout(250); await btn.click({ timeout: 8000 }); }
+  await Promise.race([
+    page.getByText(/saved|success/i).first().waitFor({ timeout: 5000 }).catch(() => {}),
+    page.waitForResponse(r => r.url().includes(`/ad-exchange/dsp/`) &&
+                               ['PUT','POST','PATCH'].includes(r.request().method()), { timeout: 8000 }).catch(()=>null),
+    page.waitForLoadState('domcontentloaded')
+  ]);
+}
+
+// NEW: robust opener that tolerates ERR_ABORTED, waits on URL + selector, retries once
+async function openDspEdit(page, dspId) {
+  const url = `${BASE_URL}/ad-exchange/dsp/${encodeURIComponent(dspId)}/edit`;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (err) {
+      if (!String(err).includes('ERR_ABORTED')) throw err; // only ignore the known race
+    }
+    // If app does a soft redirect, make sure we're on the right route
+    await page.waitForURL(/\/ad-exchange\/dsp\/\d+\/edit/i, { timeout: 20000 }).catch(()=>{});
+    try {
+      await qpsInput(page); // confirm the field is present
+      return;               // success
+    } catch (e) {
+      if (attempt === 2) throw e;
+      await page.waitForTimeout(1200);
+    }
+  }
+}
+
+async function saveAndVerify(page, dspId, expected) {
+  const editUrl = `${BASE_URL}/ad-exchange/dsp/${encodeURIComponent(dspId)}/edit`;
+  const saveBtn = await findExactSaveButton(page);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const want = await setQpsAndGetEffective(page, expected);
+    await waitEnabledAndClick(page, saveBtn);
+
+    // Re-open robustly (instead of a bare goto)
+    await openDspEdit(page, dspId);
+
+    const after = await readCurrentLimit(page);
+    if (after === want) return; // success
+    console.log(`(attempt ${attempt}) UI showed ${want} but after reload saw ${after} — retrying...`);
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const shot = path.join(OUT_DIR, `after-save-failed-${ts}.png`);
+  await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+  throw new Error(`Save did not persist after 3 attempts. Screenshot: ${shot}`);
+}
+
+// ====== Main ======
+(async () => {
+  ensureOutDir();
+
+  const creds = readLogin();
+  const { hourKey, items } = await fetchLastHourRows(creds);
+  if (!items.length) {
+    console.log(`No rows for last full hour ${hourKey}. Exiting.`);
+    process.exit(0);
   }
 
-  // 2) login + iterate DSP items
-  const browser = await chromium.launch({ headless: HEADLESS, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  // Snapshot CSV for transparency
+  const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;
+  const snapHeader = ['hour_utc','dsp_company','dsp_id','qps','bid_requests','dsp_srcpm'];
+  const snapPath = path.join(OUT_DIR, `last-hour-snapshot-${hourKey.replace(/[: ]/g,'-')}.csv`);
+  fs.writeFileSync(
+    snapPath,
+    '\uFEFF'+[snapHeader.join(','), ...items.map(r =>
+      [r.hour_utc, r.dsp_company, r.dsp_id, (Number.isFinite(r.qps)? r.qps.toFixed(3):''), r.bid_requests, r.dsp_srcpm]
+        .map(esc).join(',')
+    )].join('\n'),
+    'utf8'
+  );
+  console.log(`Snapshot → ${snapPath}`);
+
+  // Allow filtering
+  let rows = items.slice();
+  if (!ALLOW_MODE_ALL) {
+    const allowedNorms = ALLOW_DSPS.map(normName);
+    rows = rows.filter(r => {
+      const n = normName(r.dsp_company);
+      return allowedNorms.some(a => n.includes(a) || a.includes(n));
+    });
+  }
+  if (ALLOW_DSP_IDS.length) {
+    const idSet = new Set(ALLOW_DSP_IDS.map(String));
+    rows = rows.filter(r => idSet.has(String(r.dsp_id)));
+  }
+  if (!rows.length) {
+    console.log('No rows matched filters (ALLOW_DSPS/ALLOW_DSP_IDS). Exiting.');
+    process.exit(0);
+  }
+
+  // Launch Playwright and apply rules (DRY_RUN will not click Save)
+  const browser = await chromium.launch({ headless: HEADLESS });
   const context = await browser.newContext();
   const page = await context.newPage();
-  await loginUI(page, creds.email, creds.password);
-
   const actions = [];
 
-  for (const r of targets) {
-    const url = `${BASE}/ad-exchange/dsp/${r.dsp_id}/edit`;
-    const qps = Number(r.qps) || 0;
-    const srcpm = Number(r.dsp_srcpm) || 0;
+  try {
+    await uiLogin(page, creds.email, creds.password);
 
-    try {
-      await page.goto(url, { waitUntil: 'networkidle' });
-      await page.waitForSelector('#max_qps_limit', { timeout: 15000 });
-      const currentLimit = await readCurrentLimit(page);
+    for (const r of rows) {
+      const dspId = String(r.dsp_id || '').trim();
+      if (!dspId) continue;
 
-      const { action, newLimit, rule } = decideAction({ srcpm, qps, currentLimit });
-      const changed = action !== 'none' && newLimit !== currentLimit;
+      console.log(`\n→ ${r.dsp_company} [${dspId}] srcpm=${r.dsp_srcpm} qps=${Number(r.qps).toFixed(2)}  URL: ${BASE_URL}/ad-exchange/dsp/${dspId}/edit`);
 
-      if (!DRY_RUN && changed) {
-        await setLimitAndSave(page, newLimit);
+      // Robust open
+      await openDspEdit(page, dspId);
+
+      const current = await readCurrentLimit(page);
+      const decision = decideNewLimit({ srcpm: Number(r.dsp_srcpm), qps: Number(r.qps), current });
+      const saturation = current > 0 ? (Number(r.qps) / current) * 100 : 0;
+
+      let wouldSaveValue = '';
+      if (DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
+        // Type into the field to see UI normalization/validation, but DO NOT save.
+        wouldSaveValue = await setQpsAndGetEffective(page, decision.newLimit);
+        console.log(`   [DRY RUN] current=${current} → proposed=${decision.newLimit} → UI shows ${wouldSaveValue} (${decision.reason})`);
+      } else if (!DRY_RUN && decision.action !== 'hold' && Number.isFinite(decision.newLimit)) {
+        await saveAndVerify(page, dspId, decision.newLimit);
+        const saved = await readCurrentLimit(page);
+        console.log(`   savedLimit=${saved}`);
+        wouldSaveValue = saved;
+      } else {
+        console.log('   No change.');
       }
 
       actions.push({
-        hour_utc: r.hour_utc,
-        company_dsp: r.company_dsp,
-        dsp_id: r.dsp_id,
-        srcpm: srcpm.toFixed(3),
-        bid_requests: r.bid_requests,
-        qps: qps.toFixed(2),
-        current_limit: currentLimit,
-        proposed_limit: newLimit,
-        action: changed ? action : 'none',
-        rule,
-        mode: DRY_RUN ? 'dry-run' : 'live',
-        url
-      });
-
-      console.log(`→ ${r.company_dsp} [${r.dsp_id}] srcpm=${srcpm} qps=${qps.toFixed(2)} current=${currentLimit} ${changed ? `→ ${action} to ${newLimit}` : '→ no change'} (${rule})`);
-
-    } catch (err) {
-      console.error(`Failed on DSP ${r.dsp_id} (${r.company_dsp}):`, err.message);
-      actions.push({
-        hour_utc: r.hour_utc,
-        company_dsp: r.company_dsp,
-        dsp_id: r.dsp_id,
-        srcpm: srcpm,
-        bid_requests: r.bid_requests,
-        qps: qps,
-        current_limit: '',
-        proposed_limit: '',
-        action: 'error',
-        rule: err.message,
-        mode: DRY_RUN ? 'dry-run' : 'live',
-        url
+        dsp_id: dspId,
+        dsp_company: r.dsp_company,
+        srcpm: r.dsp_srcpm,
+        qps: Number(r.qps?.toFixed?.(2)),
+        current_limit: current,
+        proposed_limit: decision.newLimit,
+        would_save_value: wouldSaveValue,
+        saturation_pct: Number.isFinite(saturation) ? Number(saturation.toFixed(1)) : '',
+        action: decision.action,
+        reason: decision.reason
       });
     }
+  } finally {
+    await page.close(); await context.close(); await browser.close();
   }
 
-  await browser.close();
-
-  const actFile = path.join('output', `actions-${isoTag}.csv`);
-  fs.writeFileSync(actFile, csv(actions));
-  console.log(`${DRY_RUN ? '✅ Actions (DRY_RUN=true)' : '✅ Actions (LIVE)'} → ${actFile}`);
-})().catch(err => {
-  console.error('Run failed:', err);
+  // Audit CSV (includes proposed & would_save_value)
+  const actHeader = [
+    'dsp_id','dsp_company','srcpm','qps',
+    'current_limit','proposed_limit','would_save_value','saturation_pct',
+    'action','reason'
+  ];
+  const actPath = path.join(OUT_DIR, `actions-${new Date().toISOString().replace(/[:.]/g,'-')}.csv`);
+  fs.writeFileSync(actPath, '\uFEFF'+[
+    actHeader.join(','),
+    ...actions.map(a => actHeader.map(k => esc(a[k])).join(','))
+  ].join('\n'), 'utf8');
+  console.log(`\n✅ Actions (DRY_RUN=${DRY_RUN}) → ${actPath}`);
+})().catch(err=>{
+  console.error('Error:', err.message||err);
   process.exit(1);
 });
