@@ -49,7 +49,7 @@ jobs:
           # ——— Core config ———
           TEQ_BASE_URL: ${{ secrets.TEQ_BASE_URL || 'https://ssp.playdigo.com' }}
           HEADLESS: "true"           # CI should use headless
-          DRY_RUN: "true"            # set to "false" to actually save changes
+          DRY_RUN: "false"            # set to "false" to actually save changes
           DEBUG_API: "0"             # "1" for verbose API logs
 
           # ——— Targeting ———
