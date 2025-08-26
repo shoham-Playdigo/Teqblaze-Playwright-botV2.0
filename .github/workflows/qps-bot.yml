@@ -55,7 +55,7 @@ jobs:
           # ——— Targeting ———
           ALLOW_DSPS: "ALL"          # operate on ALL…
           EXCLUDE_DSPS: "Magnite"    # …but exclude Magnite by name
-          EXCLUDE_DSP_IDS: "411,412,396,414"
+          EXCLUDE_DSP_IDS: "411,412,396,414,255"
           # ALLOW_DSP_IDS: "15,184,320"   # optional allowlist by IDs
           # EXCLUDE_DSP_IDS: "999"        # optional blocklist by IDs
 
