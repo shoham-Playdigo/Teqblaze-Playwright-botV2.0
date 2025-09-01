@@ -17,7 +17,7 @@ const RAW_ALLOW = (process.env.ALLOW_DSPS || 'ALL').trim();
 const ALLOW_MODE_ALL = RAW_ALLOW === '' || /^all$/i.test(RAW_ALLOW) || RAW_ALLOW === '*';
 const ALLOW_DSPS = ALLOW_MODE_ALL ? [] : RAW_ALLOW.split(',').map(s => s.trim()).filter(Boolean);
 
-const EXCLUDE_DSPS = (process.env.EXCLUDE_DSPS || 'Magnite')
+const EXCLUDE_DSPS = (process.env.EXCLUDE_DSPS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const EXCLUDE_DSP_IDS = (process.env.EXCLUDE_DSP_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
