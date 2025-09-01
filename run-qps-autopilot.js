@@ -168,8 +168,8 @@ async function fetchLastHourRows({email,password}){
 function decideNewLimit({srcpm,qps,current}){
   if (srcpm < 0.005) return { action:'set',      newLimit:CRITICAL_SET_TO,                                  reason:'srcpm<0.005→set100' };
   if (srcpm < 0.25)  return { action:'decrease', newLimit:Math.max(FLOOR_MIN, Math.floor(current*DOWN_PCT)), reason:'srcpm<0.25→-15%'   };
-  if (srcpm > 0.55 && qps >= SAT_QPS_PCT*current)
-                     return { action:'increase', newLimit:Math.min(CAP_MAX, Math.round(current*UP_PCT)),     reason:'srcpm>0.55 & qps>=70%→+15%' };
+  if (srcpm > 0.35 && qps >= SAT_QPS_PCT*current)
+                     return { action:'increase', newLimit:Math.min(CAP_MAX, Math.round(current*UP_PCT)),     reason:'srcpm>0.35 & qps>=70%→+15%' };
   return { action:'hold', newLimit:current, reason:'no-change' };
 }
 
