@@ -11,7 +11,7 @@ permissions:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60   # <<< CHANGED: was 25. Give the job more headroom.
     concurrency:
       group: qps-bot
       cancel-in-progress: false
@@ -36,8 +36,21 @@ jobs:
           # deps used by run-qps-autopilot.js
           npm install dotenv
           npm install playwright@latest
-          # install Chromium + Linux system deps on the runner
-          npx playwright install --with-deps chromium
+
+      # ---------- Playwright browser cache ----------
+      - name: Cache Playwright browsers   # <<< NEW: caches ~/.cache/ms-playwright so browsers aren't re-downloaded
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+      # ---------------------------------------------
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        # NOTE: keeping --with-deps as in your original file. It installs OS libs each run.
+        # Once you confirm they’re present on the runner, you can drop --with-deps to speed up further.
 
       - name: Create login file from secrets
         shell: bash
